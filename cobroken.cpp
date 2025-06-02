@@ -11,44 +11,101 @@
 #include <vector>
 #include <tuple>
 #include <set>
+#include <variant>
 
 #define DBGOUT(...) do { std::ostringstream ost; ost << std::this_thread::get_id() << " - " << __VA_ARGS__ << "\n"; std::cerr << ost.str(); } while (0)
 
 std::stop_source stop{};
 
+class HistoryAdd
+{
+    void* from{};
+    void* to{};
+    std::thread::id t{std::this_thread::get_id()};
+public:
+    HistoryAdd(std::coroutine_handle<> f, std::coroutine_handle<> t) : from{f.address()}, to{t.address()} {}
+    void Show(std::ostream& ost) const
+    {
+        ost << t << " transfer from " << from << " to " << to;
+    }
+};
+
+class HistoryResume
+{
+    void* co{};
+    std::thread::id t{std::this_thread::get_id()};
+public:
+    HistoryResume(std::coroutine_handle<> c) : co{c.address()} {}
+    void Show(std::ostream& ost) const
+    {
+        ost << t << " await_resume " << co;
+    }
+};
+
+class HistorySuspend
+{
+    void* co{};
+    bool how{};
+    std::thread::id t{std::this_thread::get_id()};
+public:
+    HistorySuspend(std::coroutine_handle<> c, bool h) : co{c.address()}, how{h} {}
+    void Show(std::ostream& ost) const
+    {
+        ost << t << (how ? " suspending " : " resuming ") << co;
+    }
+};
+
+class HistoryBusted
+{
+    void* co{};
+    std::thread::id t{std::this_thread::get_id()};
+public:
+    HistoryBusted(std::coroutine_handle<> c) : co{c.address()} {}
+    void Show(std::ostream& ost) const
+    {
+        ost << t << " busted " << co;
+    }
+};
+
 class History
 {
-    using Type = std::tuple<std::thread::id, void*, void*>;
-    inline static constexpr size_t maximum = 200UL;
+    using Type = std::variant<HistoryAdd, HistoryResume, HistorySuspend, HistoryBusted>;
+    inline static constexpr size_t maximum = 2000UL;
     std::vector<Type> vec_{};
     unsigned int offset_{};
     mutable std::mutex mutex_{};
 public:
     History() { vec_.reserve(maximum); }
-    void Record(std::thread::id t, void* a, void* b)
+    template <typename Entry>
+    void Record(Entry&& entry)
     {
         std::scoped_lock guard{mutex_};
         if (vec_.size() < maximum)
         {
-            vec_.emplace_back(t, a, b);
+            vec_.push_back(std::forward<Entry>(entry));
             ++offset_;
             return;
         }
         offset_ = (offset_ % maximum);
-        Type& entry = vec_[offset_];
+        Type& item = vec_[offset_];
         ++offset_;
-        entry = Type{t, a, b};
+        item = std::forward<Entry>(entry);
     }
-    void Show() const
+    void Show()
     {
         std::scoped_lock guard{mutex_};
-        DBGOUT(" --- history " << vec_.size() << " ---");
-        unsigned o = (offset_ + (maximum * 2) - vec_.size());
+        auto vec = std::move(vec_);
+        unsigned o = (offset_ + (maximum * 2) - vec.size());
+        offset_ = 0U;
+
+        DBGOUT(" --- history " << vec.size() << " ---");
+
         std::ostringstream ost;
-        for (size_t i = 0U ; i < vec_.size() ; ++i)
+        for (size_t i = 0U ; i < vec.size() ; ++i)
         {
-            auto [t, p1, p2] = vec_[--o % maximum];
-            ost << " - " << t << ":  " << p1 << " starts " << p2 << "\n";
+            std::visit([&ost](auto&& arg) mutable
+                       { arg.Show(ost); }, vec[--o % maximum]);
+            ost << "\n";
         }
         std::cerr << ost.str();
     }
@@ -82,28 +139,6 @@ public:
 };
 using CoroutineHandle = std::coroutine_handle<Task::promise_type>;
 
-class Watch
-{
-    mutable std::mutex mutex_{};
-    std::set<std::coroutine_handle<>> handles_{};
-public:
-    void Add(std::coroutine_handle<> h)
-    {
-        std::scoped_lock guard{mutex_};
-        handles_.insert(h);
-    }
-
-    bool IsWatched(std::coroutine_handle<> h) const
-    {
-        std::scoped_lock guard{mutex_};
-        if (auto it = handles_.find(h); it != handles_.end()) {
-            return true;
-        }
-        return false;
-    }
-};
-
-Watch watchlist{};
 
 
 class Handles
@@ -144,16 +179,13 @@ public:
     bool await_ready() { return false; }
     std::coroutine_handle<> await_suspend(CoroutineHandle me)
     {
-        if (watchlist.IsWatched(me))
-        {
-            DBGOUT("Adding back a watched handle: " << me.address());
-        }
         me_ = me;
         if (me != mine_) {
             DBGOUT(" XXX suspend is suspending the wrong coroutine " << me.address() << " when we thought we were in " << mine_.address());
         }
         me.promise().suspendedBy_ = std::this_thread::get_id();
         me.promise().suspended_.store(true);
+        history.Record(HistorySuspend(me, true));
         std::coroutine_handle<> destination = destination_;
         handles_.Add(me);
         ++transferCount;
@@ -163,11 +195,13 @@ public:
         if (!me_) {
             DBGOUT("awaiter did not suspend!");
         }
+        history.Record(HistoryResume{me_});
         if (!me_.promise().suspended_.exchange(false))
         {
             DBGOUT("waking " << me_.address() << " when it was not suspended");
             return false;
         }
+        history.Record(HistorySuspend(me_, false));
         return true;
 
     }
@@ -197,14 +231,10 @@ Task Op(std::stop_token token, Handles& handles)
         if (CoroutineHandle next = handles.Get())
         {
             expected = next;
-            history.Record(std::this_thread::get_id(), mine.address(), next.address());
+            history.Record(HistoryAdd{mine, next});
             // DBGOUT(" > " << mine.address() << " transferring to " << next.address());
             auto transferFrom = std::this_thread::get_id();
             next.promise().wakeOn_ = std::this_thread::get_id();
-            if (watchlist.IsWatched(next))
-            {
-                DBGOUT("about to wake a watched coroutine " << next.address());
-            }
             if (!co_await Transfer{handles, next, mine})
             {
                 DBGOUT("unsuspended coroutine started, me=" << mine.address() << ", didn't start " << expected.address());
@@ -214,14 +244,10 @@ Task Op(std::stop_token token, Handles& handles)
                 DBGOUT("unexpectedly did not wake " << mine.address() << " on the expected thread " << mine.promise().wakeOn_);
                 success = false;
             }
-            if (watchlist.IsWatched(mine))
-            {
-                DBGOUT("somehow, we woke a watched coroutine " << mine.address());
-            }
             if (expected != mine)
             {
                 DBGOUT("oops, coroutine " << mine.address() << " woken instead of " << expected.address() << " after " << transferCount.load() << " transfers, transfer from " << transferFrom);
-                watchlist.Add(expected);
+                history.Record(HistoryBusted{mine});
                 success = false;
                 history.Show();
                 stop.request_stop();
@@ -229,6 +255,7 @@ Task Op(std::stop_token token, Handles& handles)
         }
         else {
             DBGOUT("no handles");
+            history.Show();
             co_await std::suspend_always();
             DBGOUT("unexpectedly re-awoken");
         }
@@ -248,13 +275,13 @@ void Run(std::stop_token token, Handles* handles)
     }
 }
 
-void test()
+bool test()
 {
     Handles handles{};
     std::vector<std::jthread> threads_{};
     std::vector<Task> tasks_{};
 
-    for (unsigned int i = 0 ; i < 5 ; ++i)
+    for (unsigned int i = 0 ; i < 7 ; ++i)
     {
         Task op = Op(stop.get_token(), handles);
         tasks_.push_back(std::move(op));
@@ -268,10 +295,13 @@ void test()
     std::cerr << "stopping" << std::endl;;
     stop.request_stop();
     std::cout << "success=" << std::boolalpha << success << ", " << transferCount.load() << " transfers" << std::endl;
+    return success;
 }
 
+#ifdef WITH_MAIN
 int main()
 {
     test();
     return 0;
 }
+#endif

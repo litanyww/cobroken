@@ -1,4 +1,9 @@
 /tests
 *.[oa]
 *.log
+*.out
+*.exe
+*.ilk
+*.obj
+*.pdb
 
