@@ -298,7 +298,7 @@ bool test()
     return success;
 }
 
-#ifdef WITH_MAIN
+#ifndef OMIT_MAIN
 int main()
 {
     test();
